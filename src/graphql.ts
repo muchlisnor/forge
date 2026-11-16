@@ -16,9 +16,9 @@ export interface GraphQLContext {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
+  res.end(buf);
 }
 
 function bearerOk(req: IncomingMessage, token: string): boolean {
@@ -43,7 +43,7 @@ function readBody(req: IncomingMessage, limitBytes = 16 * 1024 * 1024): Promise<
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -898,8 +898,7 @@ function runOperation(ctx: GraphQLContext, request: OperationRequest): Record<st
  * Route one GraphQL request. Returns true when handled, false when the path is
  * not /api/graphql.
  */
-export async function handleGraphQL(ctx: GraphQLContext, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? '/', 'http://entry');
+export async function handleGraphQL(ctx: GraphQLContext, req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   if (url.pathname !== '/api/graphql') return false;
   if ((req.method ?? 'GET') !== 'POST') {
     sendJson(res, 405, { data: null, errors: [{ message: 'GraphQL needs POST.' }] });

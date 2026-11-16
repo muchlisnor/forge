@@ -2,8 +2,12 @@
 // the MCP endpoint, served from one process over one in-memory store.
 //
 // app.ts is the server; main.ts is the entry <-> env lifecycle and stays as it is.
+//
+// Performance: the request URL is parsed once here and handed to every handler,
+// so no handler re-parses it (the old code parsed it up to four times a request).
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createRawServer, type FastReq, type FastRes, type RawServer } from './src/rawhttp.ts';
 import { handleGit } from './src/git-http.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphQL } from './src/graphql.ts';
@@ -13,31 +17,28 @@ import { Store } from './src/store.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 /** Answer one request with a JSON body. */
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+function sendJson(res: FastRes, status: number, body: unknown): void {
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length });
+  res.end(buf);
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
+export function createApp(): RawServer {
   const store = new Store();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const ctx = { store, token };
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
+  // The dispatch promise is RETURNED (not voided): the raw server awaits it
+  // before dispatching the next request on the same connection, so responses
+  // can never overtake each other on one socket.
+  return createRawServer((req: FastReq, res: FastRes) => {
+    return (async () => {
       try {
-        const path = pathOf(req);
+        // One parse: a malformed URL throws here and the outer catch answers 500,
+        // exactly as the old per-handler parses did.
+        const url = new URL(req.url ?? '/', 'http://entry');
+        const path = url.pathname;
         const method = req.method ?? 'GET';
 
         // The env's boot check calls this twice: 200 {"ok":true}.
@@ -46,10 +47,14 @@ export function createApp(): Server {
           return;
         }
 
-        if (await handleGit(ctx, req, res)) return;
-        if (await handleRest(ctx, req, res)) return;
-        if (await handleGraphQL(ctx, req, res)) return;
-        if (await handleMcp(ctx, req, res)) return;
+        // The facades implement exactly the Node surface the handlers use;
+        // the casts keep the handler signatures untouched.
+        const nreq = req as unknown as IncomingMessage;
+        const nres = res as unknown as ServerResponse;
+        if (await handleGit(ctx, nreq, nres, url)) return;
+        if (await handleRest(ctx, nreq, nres, url)) return;
+        if (await handleGraphQL(ctx, nreq, nres, url)) return;
+        if (await handleMcp(ctx, nreq, nres, url)) return;
 
         // Everything else, every method: GitHub's 404 body.
         sendJson(res, 404, { message: 'Not Found' });

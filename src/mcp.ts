@@ -139,15 +139,15 @@ function readBody(req: IncomingMessage, limitBytes = 16 * 1024 * 1024): Promise<
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
+  res.end(buf);
 }
 
 interface RpcError {
@@ -326,8 +326,7 @@ function callTool(ctx: McpContext, name: string, args: Record<string, unknown>):
 /**
  * Route one MCP request. Returns true when handled, false when the path is not /mcp.
  */
-export async function handleMcp(ctx: McpContext, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? '/', 'http://entry');
+export async function handleMcp(ctx: McpContext, req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   if (url.pathname !== '/mcp') return false;
   if ((req.method ?? 'GET') === 'DELETE') {
     // A legacy session close: nothing is held, so any DELETE is a no-op 204.

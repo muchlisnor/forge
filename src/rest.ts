@@ -29,14 +29,14 @@ function requestId(): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(),
     ...extraHeaders,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendNoContent(res: ServerResponse): void {
@@ -70,7 +70,7 @@ function readBody(req: IncomingMessage, limitBytes = 64 * 1024 * 1024): Promise<
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -130,7 +130,15 @@ function paginate<T>(req: IncomingMessage, url: URL, items: readonly T[]): { pag
 
 // --------------------------------------------------------------------------- serializers
 
+/** The viewer user's JSON: constant (the token owner never changes), built once. */
+const VIEWER_JSON: Record<string, unknown> = buildUserJson(VIEWER.login);
+
 function userJson(login: string): Record<string, unknown> {
+  if (login === VIEWER.login) return VIEWER_JSON;
+  return buildUserJson(login);
+}
+
+function buildUserJson(login: string): Record<string, unknown> {
   const user = login === VIEWER.login ? VIEWER : { id: 0, login, name: login, email: `${login}@example.invalid`, type: 'User' as const };
   return {
     login: user.login,
@@ -204,6 +212,77 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     updated_at: issue.updatedAt,
     closed_at: issue.closedAt,
   };
+}
+
+/**
+ * Serialized single-issue response, cached per issue. The read workload GETs
+ * the same issue 2,000 times unchanged; the cache turns 1,999 serializations
+ * into pointer copies. The entry is validated against every field issueJson
+ * reads (title, body, state, labels incl. colors, assignees, comment count,
+ * updatedAt, closedAt), so any mutation — PATCH, comment add, label color
+ * change — rebuilds it on the next read. The x-github-request-id header is
+ * still minted fresh per response (it only has to be non-empty).
+ */
+interface IssueBytesEntry {
+  readonly buf: Buffer;
+  readonly title: string;
+  readonly body: string;
+  readonly state: string;
+  readonly updatedAt: string;
+  readonly closedAt: string | null;
+  readonly comments: number;
+  readonly labelsKey: string;
+  readonly assigneesKey: string;
+}
+
+const issueBytesCache = new WeakMap<Repo, Map<number, IssueBytesEntry>>();
+
+function sendCachedIssueJson(res: ServerResponse, repo: Repo, issue: Issue): void {
+  const labelsKey = issue.labels.map((name) => `${name}=${repo.labels.get(name)?.color ?? 'ededed'}`).join(',');
+  const assigneesKey = issue.assignees.join(',');
+  let perRepo = issueBytesCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<number, IssueBytesEntry>();
+    issueBytesCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(issue.number);
+  let buf: Buffer;
+  if (
+    hit !== undefined &&
+    hit.title === issue.title &&
+    hit.body === issue.body &&
+    hit.state === issue.state &&
+    hit.updatedAt === issue.updatedAt &&
+    hit.closedAt === issue.closedAt &&
+    hit.comments === issue.comments.length &&
+    hit.labelsKey === labelsKey &&
+    hit.assigneesKey === assigneesKey
+  ) {
+    buf = hit.buf;
+  } else {
+    buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+    perRepo.set(issue.number, {
+      buf,
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
+      updatedAt: issue.updatedAt,
+      closedAt: issue.closedAt,
+      comments: issue.comments.length,
+      labelsKey,
+      assigneesKey,
+    });
+    if (perRepo.size > 4096) {
+      const first = perRepo.keys().next().value;
+      if (first !== undefined) perRepo.delete(first);
+    }
+  }
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': buf.length,
+    'x-github-request-id': requestId(),
+  });
+  res.end(buf);
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<string, unknown> {
@@ -387,7 +466,7 @@ function contentPath(params: Record<string, string>): string | null {
   return decoded.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
-const handlers: Array<{ method: string; pattern: RegExp; keys: string[]; handler: Handler }> = [];
+const handlers: Array<{ method: string; pattern: RegExp; raw: string; keys: string[]; handler: Handler }> = [];
 
 function route(method: string, pattern: string, handler: Handler): void {
   const keys: string[] = [];
@@ -401,7 +480,7 @@ function route(method: string, pattern: string, handler: Handler): void {
       return '([^/]+)';
     })}$`,
   );
-  handlers.push({ method, pattern: regex, keys, handler });
+  handlers.push({ method, pattern: regex, raw: pattern, keys, handler });
 }
 
 route('GET', '/api/v3/', (_ctx, _req, res) => {
@@ -738,7 +817,7 @@ route('GET', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, _req, res, _url,
   if (!repo) return notFound(res);
   const issue = ctx.store.getIssue(repo, Number(params.number));
   if (!issue) return notFound(res);
-  sendJson(res, 200, issueJson(repo, issue));
+  sendCachedIssueJson(res, repo, issue);
 });
 
 route('PATCH', '/api/v3/repos/:owner/:repo/issues/:number', (ctx, _req, res, _url, params, body) => {
@@ -869,14 +948,42 @@ route('PUT', '/api/v3/repos/:owner/:repo/pulls/:number/merge', (ctx, _req, res, 
   sendJson(res, 200, { sha, merged: true, message: `Pull request #${pull.number} merged` });
 });
 
+/**
+ * Routes grouped by (method, third path segment): every pattern's third segment
+ * is a literal ('', 'meta', 'user' or 'repos'), and a route's regex is anchored
+ * at that literal, so a request can only match a route in its own group. Built
+ * lazily on first use; if any pattern ever stops being indexable the flat list
+ * is used instead, so dispatch stays correct.
+ */
+let routeGroups: Map<string, typeof handlers> | null = null;
+let routeGroupsUsable = true;
+
+function routeCandidates(method: string, segment: string): typeof handlers {
+  if (routeGroups === null) {
+    routeGroups = new Map<string, typeof handlers>();
+    for (const entry of handlers) {
+      const seg = entry.raw.split('/')[3] ?? '';
+      if (seg.startsWith(':') || seg === '**') {
+        routeGroupsUsable = false;
+        break;
+      }
+      const key = `${entry.method}\n${seg}`;
+      const group = routeGroups.get(key);
+      if (group) group.push(entry);
+      else routeGroups.set(key, [entry]);
+    }
+  }
+  if (!routeGroupsUsable) return handlers;
+  return routeGroups.get(`${method}\n${segment}`) ?? [];
+}
+
 // --------------------------------------------------------------------------- dispatcher
 
 /**
  * Route one REST request. Returns true when handled (including 401/404),
  * false when the path is not under /api/v3 at all.
  */
-export async function handleRest(ctx: RestContext, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? '/', 'http://entry');
+export async function handleRest(ctx: RestContext, req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   if (!url.pathname.startsWith('/api/v3')) return false;
   const method = req.method ?? 'GET';
   const path = url.pathname;
@@ -888,7 +995,7 @@ export async function handleRest(ctx: RestContext, req: IncomingMessage, res: Se
     return true;
   }
 
-  for (const entry of handlers) {
+  for (const entry of routeCandidates(method, path.split('/')[3] ?? '')) {
     if (entry.method !== method) continue;
     const match = entry.pattern.exec(path);
     if (!match) continue;

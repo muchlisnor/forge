@@ -62,7 +62,7 @@ export function readBody(req: IncomingMessage, limitBytes = 256 * 1024 * 1024): 
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -133,9 +133,39 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return encodePktLines(lines);
 }
 
+/** The protocol-v2 advertisement never changes: one shared buffer. */
+const V2_ADVERTISEMENT = v2Advertisement('git-upload-pack');
+
+/**
+ * Per-repo cache of v0 advertisements, keyed by service + ref tips: the clone
+ * workload asks for the same advertisement fifty times against an unchanged
+ * repo. Bounded per repo (FIFO). Objects are immutable and only ever added, so
+ * the ref tips determine the advertisement (the default branch never changes,
+ * and a tag object only becomes reachable through a ref tip the key names).
+ */
+const advertisementCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const tips = [...repo.refs.entries()].map(([name, oid]) => `${name}=${oid}`).sort().join(',');
+  const key = `${service}\n${tips}`;
+  let perRepo = advertisementCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    advertisementCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
+  const built = v0Advertisement(repo, service);
+  perRepo.set(key, built);
+  if (perRepo.size > 16) {
+    const first = perRepo.keys().next().value;
+    if (first !== undefined) perRepo.delete(first);
+  }
+  return built;
+}
+
 /** GET /:owner/:repo.git/info/refs?service=... — advertisement or 404 for a missing repo. */
-export function handleInfoRefs(ctx: GitHttpContext, req: IncomingMessage, res: ServerResponse, owner: string, repoName: string): void {
-  const url = new URL(req.url ?? '/', 'http://entry');
+export function handleInfoRefs(ctx: GitHttpContext, req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, url: URL): void {
   const service = url.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendText(res, 400, 'missing or unknown service');
@@ -148,10 +178,10 @@ export function handleInfoRefs(ctx: GitHttpContext, req: IncomingMessage, res: S
   }
   const contentType = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && req.headers['git-protocol'] === 'version=2') {
-    sendBytes(res, 200, v2Advertisement(service), contentType);
+    sendBytes(res, 200, V2_ADVERTISEMENT, contentType);
     return;
   }
-  sendBytes(res, 200, v0Advertisement(repo, service), contentType);
+  sendBytes(res, 200, advertisementV0(repo, service), contentType);
 }
 
 // --------------------------------------------------------------------------- v2
@@ -363,6 +393,8 @@ interface FetchCacheEntry {
   readonly acks: string[];
   readonly nak: boolean;
   readonly ready: boolean;
+  /** Fully assembled protocol-v2 fetch response (ack lines, ready, shallow-info, packfile, sideband). */
+  readonly responseV2: Buffer;
 }
 
 const fetchCache = new WeakMap<Repo, Map<string, FetchCacheEntry>>();
@@ -388,13 +420,75 @@ function cachedFetch(repo: Repo, args: FetchArgs): FetchCacheEntry {
   const hit = perRepo.get(key);
   if (hit !== undefined) return hit;
   const { objects, shallow, unshallow, acks, nak, ready } = fetchObjects(repo, args);
-  const entry: FetchCacheEntry = { pack: writePack(objects), shallow, unshallow, acks, nak, ready };
+  const pack = writePack(objects);
+  // Assemble the full protocol-v2 fetch response once; the handler sends this
+  // buffer verbatim on every cache hit (the clone workload replays it 50x).
+  // This mirrors handleUploadPackV2's fetch branch exactly (ready only when
+  // set, shallow-info only when there are shallow/unshallow lines).
+  const v2Parts: Buffer[] = [encodePktLine('acknowledgments\n')];
+  if (nak) v2Parts.push(encodePktLine('NAK\n'));
+  for (const ack of acks) v2Parts.push(encodePktLine(`ACK ${ack}\n`));
+  if (ready) v2Parts.push(encodePktLine('ready\n'));
+  v2Parts.push(Buffer.from('0000', 'ascii'));
+  if (shallow.length || unshallow.length) {
+    v2Parts.push(encodePktLine('shallow-info\n'));
+    for (const oid of shallow) v2Parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) v2Parts.push(encodePktLine(`unshallow ${oid}\n`));
+    v2Parts.push(Buffer.from('0000', 'ascii'));
+  }
+  v2Parts.push(encodePktLine('packfile\n'));
+  v2Parts.push(...sidebandPackets(1, pack));
+  v2Parts.push(Buffer.from('0000', 'ascii'));
+  const entry: FetchCacheEntry = { pack, shallow, unshallow, acks, nak, ready, responseV2: Buffer.concat(v2Parts) };
   perRepo.set(key, entry);
   if (perRepo.size > 64) {
     const first = perRepo.keys().next().value;
     if (first !== undefined) perRepo.delete(first);
   }
   return entry;
+}
+
+/**
+ * ls-refs responses, keyed by the ref tips + object count (same determinism
+ * argument as the fetch cache) and the request arguments. The clone workload
+ * asks for the same ls-refs fifty times against an unchanged repo. Bounded per
+ * repo (FIFO).
+ */
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function cachedLsRefs(repo: Repo, prefixes: string[], peel: boolean, symrefs: boolean, unborn: boolean): Buffer {
+  const tips = [...repo.refs.entries()].map(([name, oid]) => `${name}=${oid}`).sort().join(',');
+  const key = JSON.stringify([tips, repo.objects.size, prefixes, peel, symrefs, unborn]);
+  let perRepo = lsRefsCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    lsRefsCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
+  const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  const lines: Array<string | 'flush'> = [];
+  for (const ref of listRefs(repo)) {
+    if (!keep(ref.name)) continue;
+    if (ref.oid === ZERO_OID) {
+      if (unborn && ref.name === 'HEAD') {
+        lines.push(`unborn HEAD${ref.symrefTarget ? ` symref-target:${ref.symrefTarget}` : ''}\n`);
+      }
+      continue;
+    }
+    let line = `${ref.oid} ${ref.name}`;
+    if (symrefs && ref.symrefTarget) line += ` symref-target:${ref.symrefTarget}`;
+    if (peel && ref.peeled) line += ` peeled:${ref.peeled}`;
+    lines.push(`${line}\n`);
+  }
+  lines.push('flush');
+  const built = encodePktLines(lines);
+  perRepo.set(key, built);
+  if (perRepo.size > 16) {
+    const first = perRepo.keys().next().value;
+    if (first !== undefined) perRepo.delete(first);
+  }
+  return built;
 }
 
 async function handleUploadPackV2(ctx: GitHttpContext, req: IncomingMessage, res: ServerResponse, repo: Repo, body: Buffer): Promise<void> {
@@ -410,23 +504,7 @@ async function handleUploadPackV2(ctx: GitHttpContext, req: IncomingMessage, res
       else if (arg === 'symrefs') symrefs = true;
       else if (arg === 'unborn') unborn = true;
     }
-    const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-    const lines: Array<string | 'flush'> = [];
-    for (const ref of listRefs(repo)) {
-      if (!keep(ref.name)) continue;
-      if (ref.oid === ZERO_OID) {
-        if (unborn && ref.name === 'HEAD') {
-          lines.push(`unborn HEAD${ref.symrefTarget ? ` symref-target:${ref.symrefTarget}` : ''}\n`);
-        }
-        continue;
-      }
-      let line = `${ref.oid} ${ref.name}`;
-      if (symrefs && ref.symrefTarget) line += ` symref-target:${ref.symrefTarget}`;
-      if (peel && ref.peeled) line += ` peeled:${ref.peeled}`;
-      lines.push(`${line}\n`);
-    }
-    lines.push('flush');
-    sendBytes(res, 200, encodePktLines(lines), 'application/x-git-upload-pack-result');
+    sendBytes(res, 200, cachedLsRefs(repo, prefixes, peel, symrefs, unborn), 'application/x-git-upload-pack-result');
     return;
   }
   if (command === 'fetch') {
@@ -458,23 +536,8 @@ async function handleUploadPackV2(ctx: GitHttpContext, req: IncomingMessage, res
       sendBytes(res, 200, bodyOut, 'application/x-git-upload-pack-result');
       return;
     }
-    const { pack, shallow, unshallow, acks, nak, ready } = cachedFetch(repo, fetchArgs);
-    const parts: Buffer[] = [];
-    parts.push(encodePktLine('acknowledgments\n'));
-    if (nak) parts.push(encodePktLine('NAK\n'));
-    for (const ack of acks) parts.push(encodePktLine(`ACK ${ack}\n`));
-    if (ready) parts.push(encodePktLine('ready\n'));
-    parts.push(Buffer.from('0000', 'ascii'));
-    if (shallow.length || unshallow.length) {
-      parts.push(encodePktLine('shallow-info\n'));
-      for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-      for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-      parts.push(Buffer.from('0000', 'ascii'));
-    }
-    parts.push(encodePktLine('packfile\n'));
-    parts.push(...sidebandPackets(1, pack));
-    parts.push(Buffer.from('0000', 'ascii'));
-    sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    const { responseV2 } = cachedFetch(repo, fetchArgs);
+    sendBytes(res, 200, responseV2, 'application/x-git-upload-pack-result');
     return;
   }
   sendText(res, 400, `unknown v2 command ${JSON.stringify(command)}`);
@@ -675,8 +738,7 @@ async function handleReceivePack(ctx: GitHttpContext, req: IncomingMessage, res:
  * Route one git smart-HTTP request. Returns true when handled (including 404/401),
  * false when the path is not a git route at all.
  */
-export async function handleGit(ctx: GitHttpContext, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? '/', 'http://entry');
+export async function handleGit(ctx: GitHttpContext, req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   const path = url.pathname;
   const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/.exec(path);
   if (!match) return false;
@@ -691,7 +753,7 @@ export async function handleGit(ctx: GitHttpContext, req: IncomingMessage, res: 
   }
 
   if (method === 'GET' && suffix === '/info/refs') {
-    handleInfoRefs(ctx, req, res, owner, repoName);
+    handleInfoRefs(ctx, req, res, owner, repoName, url);
     return true;
   }
   if (method !== 'POST') {
